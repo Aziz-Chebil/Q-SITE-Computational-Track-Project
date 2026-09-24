@@ -1,104 +1,104 @@
 # Computational Track — Our Approach & Results
 
-## Current Results (as of 2026-09-21)
+## Current Results (as of 2026-09-24)
 
-| Benchmark | Qubits | 2Q Gates | Baseline Score | Our Score | Improvement |
-|---|---|---|---|---|---|
-| ghz_star | 8 | 7 | 14.0 | 8.5 | -5.5 |
-| chain_trotter | 10 | 9 | 15.0 | 4.5 | -10.5 |
-| ladder_trotter | 12 | 16 | 35.5 | 6.5 | -29.0 |
-| qaoa_random | 10 | 18 | 39.0 | 14.0 | -25.0 |
-| dense_random | 14 | 40 | 122.0 | 52.5 | -69.5 |
-| vqe_layers | 16 | 45 | 58.0 | 3.0 | -55.0 |
-| **TOTAL** | | | **283.5** | **89.0** | **-194.5 (69%)** |
+| Benchmark | Qubits | 2Q Gates | Baseline | v1 (SA + greedy) | **v2 (current)** | Floor* |
+|---|---|---|---|---|---|---|
+| ghz_star | 8 | 7 | 14.0 | 8.5 | **6.5** | 3.5 |
+| chain_trotter | 10 | 9 | 15.0 | 4.5 | **4.5** | 4.5 |
+| ladder_trotter | 12 | 16 | 35.5 | 6.5 | **6.5** | 3.0 |
+| qaoa_random | 10 | 18 | 39.0 | 14.0 | **12.0** | 4.0 |
+| dense_random | 14 | 40 | 122.0 | 52.5 | **36.0** | 6.0 |
+| vqe_layers | 16 | 45 | 58.0 | 3.0 | **3.0** | 3.0 |
+| **TOTAL** | | | **283.5** | **89.0** | **68.5 (−76% vs baseline)** | 24.0 |
 
-Scoring formula: `score = swap_count + 0.5 * depth` (lower is better).
+Scoring formula: `score = swap_count + 0.5 * depth` (lower is better). All solutions pass validation.
+Results are deterministic (fixed seed); reproduce with `python evaluate.py`.
 
-All solutions pass validation.
-
----
-
-## What Was Implemented
-
-The `solve()` function lives in `starter.ipynb` (the cell after the "Your Submission" markdown). It has two main components:
-
-### 1. Placement — Simulated Annealing
-
-**Goal**: Map logical qubits to physical qubits so that frequently-interacting pairs are close on the hardware graph.
-
-**How it works**:
-- Precompute all-pairs shortest path distances on the 20-qubit hardware graph (instant, only 20 nodes).
-- Build an interaction list from the program: every `("2Q", a, b)` contributes one `(a, b)` pair.
-- Cost function: `sum of dist[placement[a]][placement[b]]` for every 2Q interaction. This is a proxy for how many SWAPs the router will need.
-- Seed placement: degree-matching heuristic — sort logical qubits by interaction count (descending), sort physical qubits by closeness centrality (descending), zip them together.
-- SA loop (3000 iterations per run): randomly swap two logical qubits' physical assignments, accept if cost decreases or with Boltzmann probability `exp(-delta/T)`. Cooling: `T *= 0.997`.
-- Efficient delta computation: only recompute terms involving the two swapped qubits (O(degree) instead of O(total_interactions)).
-- Multi-seed: 10 global random seeds x 15 SA restarts each = 150 SA runs total. Keep the top-5 placements per seed by placement cost.
-
-### 2. Routing — Look-ahead Greedy
-
-**Goal**: Insert SWAPs to make each 2Q gate act on adjacent physical qubits, choosing SWAPs that help future gates too.
-
-**How it works**:
-- Process gates strictly in program order (required by the scorer's validation, which checks that stripping SWAPs recovers the exact original program).
-- For each 2Q gate where the two qubits are not adjacent:
-  - Generate SWAP candidates: all hardware edges touching either of the two involved physical qubits.
-  - Score each candidate SWAP with a heuristic: `H = dist_current_gate_after_swap + W * sum(decay^k * dist_future_gate_k)` where `decay = W` and `k` ranges over the next 20 future 2Q gates.
-  - Apply the SWAP with the lowest H. Update both `placement` (logical->physical) and `reverse_placement` (physical->logical).
-  - Repeat until the gate is on adjacent qubits.
-- Safety fallback: if >40 SWAPs are tried for a single gate (shouldn't happen), fall back to greedy shortest-path routing.
-
-**Parameter sweep**: For each top placement, route with W in {0.3, 0.5, 0.7}. Keep the best (placement, routed_program) pair by `core_score`.
-
-### 3. Selection
-
-The overall search evaluates: 10 seeds x 5 top placements x 3 W values = 150 routing attempts per benchmark. The best by `core_score` is returned.
+\*Floor = `0.5 × depth of the logical program` (zero SWAPs, perfect parallelism). No solution can go
+below it, and it is usually unreachable. **chain_trotter and vqe_layers hit the floor, so they are
+provably optimal.** ghz_star at 6.5 is also optimal: the hub has at most 3 hardware neighbours, so
+reaching 7 leaves needs ≥2 hub moves, and each move is serial on the hub (depth ≥ 7 + 2 = 9).
 
 ---
 
-## What Was NOT Implemented (Potential Improvements)
+## Pipeline
 
-### High-impact ideas
+The solver lives in `solver.py` (a copy is pasted into cell 20 of `starter.ipynb` so the notebook
+runs on its own). `evaluate.py` runs it on every benchmark and prints swaps, depth, score and runtime;
+`python evaluate.py --robust` also checks unseen programs (single-qubit only, one gate, mixed 1Q/2Q,
+random 16- and 20-qubit programs).
 
-1. **SABRE algorithm (DAG-based front-layer routing)**: The current router processes gates sequentially in program order. True SABRE maintains a DAG of gate dependencies, identifies a "front layer" of executable gates, and can potentially reorder independent gates. However, the scorer requires exact program order preservation (`translated != program` check in `scorer.py:68`), which constrains reordering. A modified SABRE that respects this constraint but still uses front-layer-aware SWAP scoring could improve dense benchmarks.
+### 1. Placement candidates — Simulated Annealing on distance
+- Precompute all-pairs shortest-path distances on the 20-qubit hardware graph.
+- Cost = `sum of dist[placement[a]][placement[b]]` over every 2Q interaction.
+- Seed: degree matching (busiest logical qubits → most central physical qubits), plus 149 random starts.
+- Moves: swap two logical qubits' positions, **or move a logical qubit onto an unused physical qubit**
+  (v1 could never reach free physical qubits after seeding). O(degree) delta computation.
+- Keep the 30 best distinct placements.
 
-2. **Bidirectional routing**: Run routing forward, capture the final placement, reverse the program, route again starting from that final placement, reverse the result. Take the better of forward/reverse. The original SABRE paper shows this significantly reduces SWAP count. This is straightforward to add.
+### 2. SABRE-style bidirectional refinement
+For each candidate: route forward, take the final placement, route the **reversed** program from it,
+and use that final placement as a new initial placement (4 rounds). This moves qubits to where the
+program actually needs them. Every placement seen is scored with the fast greedy router below.
 
-3. **Routing-aware placement optimization**: Currently SA uses placement cost (sum of distances) as a proxy. Instead, run the actual router for each SA candidate and use the real `core_score` as the SA objective. This is slower but more accurate — the proxy doesn't account for gate ordering effects. Could be done for a final refinement pass on the top-K placements.
+### 3. Greedy look-ahead router (fast ranking, ~1 ms)
+Gates in strict program order. For each non-adjacent gate, try every SWAP on an edge touching either
+qubit and pick the one minimising `dist(current gate) + Σ W^k · dist(future gate k)` over the next 20 gates.
 
-4. **Depth-aware SWAP selection**: The current heuristic only considers SWAP count (distance). Adding a term that penalizes SWAPs which increase depth (by creating long sequential chains on the same qubits) could reduce the depth component of the score. The scheduler `schedule_layers_ordered` packs gates greedily — choosing SWAPs that land on different qubits enables more parallelism.
+### 4. Depth-aware beam-search router (the main v2 gain)
+The greedy router only looks at distance, but the score also pays for **depth**, and depth goes up
+when SWAPs pile onto the same qubits. The beam router optimises the true score:
+- A state holds the placement, the SWAP count, and **each physical qubit's last layer**, updated the
+  same way `schedule_layers_ordered` does. That gives the exact `swaps + 0.5·depth` at every step.
+- For each gate, states are expanded with distance-reducing SWAPs (so the swap count stays minimal
+  for that gate). The beam decides **which** qubit moves and **along which path**, which is exactly
+  what decides whether SWAPs can run in parallel.
+- Ranking: `exact score so far + λ · Σ decay^k · (dist(future gate k) − 1)`.
+  States with identical placements are merged, keeping the best.
+- On random placements a wider beam helps a lot (e.g. 97.0 → 68.5 on dense_random).
 
-5. **Expanding SWAP candidates**: Currently only edges touching the two involved physical qubits are considered. Expanding to 2-hop neighbors or even all 23 hardware edges might find SWAPs that help future gates at the cost of a detour for the current gate.
+### 5. Routing-aware placement polish
+The distance cost from step 1 is only a proxy. Run SA whose cost is the **actual routed score**
+(beam width 8, ~3.5 ms per call, results cached). There are 3 independent chains of 1500 iterations,
+each with its own random stream, started from the 3 best placements, and the best result wins.
+A single chain often gets stuck in a poor local optimum, so the best of several is more stable.
+This step took dense_random from 47.0 to 36.0.
 
-### Medium-impact ideas
+### 6. Final routing
+Re-route the polished placements with a wide beam (width 256) under four settings: two λ/decay
+pairs, plus up to 1 or 2 **sideways SWAPs** per gate. A sideways SWAP doesn't shorten the current
+gate but does shorten one of the next 3 gates. Return the best `(placement, routed_program)` by
+`core_score`. Sideways SWAPs help on some placements and hurt on others (10 wins / 9 losses on random
+dense_random placements), so they are only an extra option here. Using them inside the polish loop
+made results worse and ~2.5× slower. If a result already reaches the floor, the solver
+stops early.
 
-6. **Stretch Goal A — Gate decomposition**: The scorer has a stretch goal for improving the decomposer. Improving decomposition by N gates gives `N * 0.1` bonus. Not yet attempted.
-
-7. **Stretch Goal B — Single-qubit gate optimization**: Fuse/cancel redundant 1Q gates. Not yet attempted. PennyLane's `qml.compile` with `cancel_inverses` and `merge_rotations` transforms could help.
-
-8. **Benchmark-specific tuning**: Different benchmarks have different structures (star, chain, ladder, random, repeating layers). The SA and routing parameters could be tuned per-benchmark type. For example, `vqe_layers` has a very regular repeating structure that might benefit from a specialized placement strategy.
-
-### Lower-impact ideas
-
-9. **More SA iterations/restarts**: Diminishing returns, but the current 3000 iterations per run may not fully converge for larger benchmarks.
-
-10. **Genetic algorithms for placement**: Instead of SA, use a population-based approach that combines good placements via crossover.
+Runtime: 1–25 s per benchmark. `time_budget` (default 60 s) is a safety cap for large unseen programs.
 
 ---
 
-## Key Files
+## Ideas not implemented
 
-- `starter.ipynb` — the notebook with our `solve()` function and test harness
-- `starter_kit/scorer.py` — validation, scheduling, scoring (DO NOT MODIFY)
-- `starter_kit/baseline_routing.py` — the baseline we're beating (reference implementation)
-- `starter_kit/benchmarks.py` — benchmark program definitions
-- `starter_kit/hardware.py` — 20-qubit hardware graph definition
-- `README.md` — full problem description and algorithm references
+- **Seed ensembles**: other seeds reach 35.5 on dense_random, but running several full seeds
+  multiplies runtime, so we kept one fixed seed rather than tuning the seed to the benchmarks.
+- **Stretch goals A/B** (decomposition, 1Q optimisation): the starter kit ships no decomposer or 1Q
+  baseline to score against, so we could not measure a bonus.
+- **Benchmark-specific tuning** of beam width, λ and polish length.
+
+---
 
 ## Key Constraints
 
-- The `validate_routed_program` function in `scorer.py:62-70` checks that stripping SWAPs from the routed program recovers the EXACT original program (same operations, same order). This means gates cannot be reordered even if they are independent.
-- Every `("2Q", p, q)` in the routed program must satisfy `hardware_graph.has_edge(p, q)`.
-- Every `("SWAP", p, q)` must also be on a valid hardware edge.
-- The returned `initial_placement` must be the placement BEFORE any routing (not the final placement after SWAPs).
-- Physical qubits not assigned to any logical qubit can still be SWAP targets. The reverse_placement dict handles this with `.get()` returning None.
+- `validate_routed_program` (`scorer.py:62-70`) checks that stripping SWAPs recovers the EXACT
+  original program (same operations, same order, same qubit orientation). Gates cannot be reordered.
+- Every `("2Q", p, q)` and `("SWAP", p, q)` must be on a hardware edge.
+- The returned placement is the one BEFORE any SWAPs.
+- Unoccupied physical qubits can be SWAP targets.
+
+## Key Files
+
+- `solver.py`: the solver (source of truth; mirrored in `starter.ipynb` cell 20)
+- `evaluate.py`: benchmark + robustness harness
+- `starter_kit/scorer.py`: validation, scheduling, scoring (not modified)
+- `starter_kit/benchmarks.py`, `starter_kit/hardware.py`: benchmarks and the 20-qubit graph
