@@ -23,14 +23,6 @@ Score is `swap_count + 0.5 * depth`, lower is better. All six solutions pass
 `validate_routed_program`. \*Floor = zero SWAPs at the program's own dependency depth, a lower
 bound nobody can beat. chain_trotter, vqe_layers and ghz_star are optimal.
 
-**In one paragraph:** simulated annealing proposes placements that minimise summed hardware
-distance over all 2Q interactions. Each is refined SABRE-style: route forward, route the reversed
-program back, and reuse the final placement. Routing walks the gates in strict program order,
-which the scorer requires. A beam search picks which qubit moves and along which path, tracking
-each qubit's layer so it optimises the exact `swaps + 0.5·depth`, not just distance. Finally, a
-second annealing pass tunes the placement against the actual routed score, and the best
-`(placement, routing)` pair is returned.
-
 ---
 
 # Overview
